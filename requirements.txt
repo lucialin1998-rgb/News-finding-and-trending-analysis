@@ -1,0 +1,5 @@
+# No mandatory third-party dependencies.
+# This project runs on Python 3.11+ standard library only.
+# Optional:
+# spacy>=3.7.0
+# If installed, also run: python -m spacy download en_core_web_sm
