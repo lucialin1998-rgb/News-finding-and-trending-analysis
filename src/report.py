@@ -12,107 +12,100 @@ def generate_reports(
     outdir: Path,
     run_date: str,
     articles: List[Article],
-    entities_by_article: Dict[str, List[dict]],
-    entity_rankings: List[Tuple[str, str, int]],
-    trends: List[str],
+    entity_rankings_bilingual: List[dict],
+    trends_en: List[str],
+    trends_zh: List[str],
+    diagnostics: Dict[str, dict],
 ) -> Tuple[Path, Path, Path]:
     outdir.mkdir(parents=True, exist_ok=True)
-
     md_path = outdir / f"weekly_report_{run_date}.md"
     articles_csv = outdir / f"articles_{run_date}.csv"
     entities_csv = outdir / f"entities_{run_date}.csv"
 
     _write_articles_csv(articles_csv, articles)
-    _write_entities_csv(entities_csv, entities_by_article)
-    _write_markdown(md_path, articles, entities_by_article, entity_rankings, trends)
-
+    _write_entities_csv(entities_csv, entity_rankings_bilingual)
+    _write_markdown(md_path, articles, entity_rankings_bilingual, trends_en, trends_zh, diagnostics)
     return md_path, articles_csv, entities_csv
 
 
 def _write_articles_csv(path: Path, articles: List[Article]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["source", "date", "title", "url", "excerpt", "auto_summary"])
-        for article in articles:
-            writer.writerow(
-                [
-                    article.source,
-                    article.date_iso,
-                    article.title,
-                    article.url,
-                    article.excerpt,
-                    " | ".join(article.summary_bullets),
-                ]
-            )
+        writer.writerow([
+            "source", "date", "title_en", "title_zh", "url", "excerpt_en", "excerpt_zh", "auto_summary_en", "auto_summary_zh"
+        ])
+        rows = 0
+        for a in articles:
+            writer.writerow([
+                a.source,
+                a.date,
+                a.title_en,
+                a.title_zh,
+                a.url,
+                a.excerpt_en,
+                a.excerpt_zh,
+                " | ".join(a.summary_en),
+                " | ".join(a.summary_zh),
+            ])
+            rows += 1
+    if rows == 0:
+        # intentionally keep header-only file, but with explicit known behavior
+        pass
 
 
-def _write_entities_csv(path: Path, entities_by_article: Dict[str, List[dict]]) -> None:
+def _write_entities_csv(path: Path, ranking_rows: List[dict]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["article_url", "entity", "category"])
-        for article_url, entities in entities_by_article.items():
-            for entity in entities:
-                writer.writerow([article_url, entity["entity"], entity["category"]])
+        writer.writerow(["entity_en", "entity_zh", "category", "count"])
+        for row in ranking_rows:
+            writer.writerow([row["entity_en"], row.get("entity_zh", ""), row["category"], row["count"]])
 
 
 def _write_markdown(
     path: Path,
     articles: List[Article],
-    entities_by_article: Dict[str, List[dict]],
-    entity_rankings: List[Tuple[str, str, int]],
-    trends: List[str],
+    entity_ranking: List[dict],
+    trends_en: List[str],
+    trends_zh: List[str],
+    diagnostics: Dict[str, dict],
 ) -> None:
-    lines = []
-    lines.append("# Weekly News Report")
+    lines: List[str] = []
+    lines.append("# Weekly Music Industry Report / 每周音乐行业报告")
     lines.append("")
     lines.append(f"Generated: {datetime.utcnow().isoformat()}Z")
+
+    lines.append("\n## Articles (last 7 days) / 近7天文章")
     lines.append("")
-    lines.append("## Articles (last 7 days)")
-    lines.append("")
-    lines.append("| Source | Date (ISO) | Title | URL | Excerpt | Auto-summary |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| Source | Date | Title (EN) | 标题(中文) | URL | Excerpt (EN) | 摘要(中文) | Auto summary (EN) | 自动总结(中文) |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for a in articles:
-        summary = "<br>".join(bullet.replace("- ", "") for bullet in a.summary_bullets)
         lines.append(
-            f"| {a.source} | {a.date_iso} | {a.title.replace('|', ' ')} | {a.url} | {a.excerpt.replace('|', ' ')} | {summary.replace('|', ' ')} |"
+            f"| {a.source} | {a.date or ''} | {a.title_en.replace('|',' ')} | {a.title_zh.replace('|',' ')} | {a.url} | {a.excerpt_en.replace('|',' ')} | {a.excerpt_zh.replace('|',' ')} | {'<br>'.join(s.replace('|',' ') for s in a.summary_en)} | {'<br>'.join(s.replace('|',' ') for s in a.summary_zh)} |"
         )
 
+    lines.append("\n## Top entities this week / 本周高频实体")
     lines.append("")
-    lines.append("## Entities by article")
-    lines.append("")
-    lines.append("| Article title | Source | Date | Entity | Category |")
+    lines.append("| Rank | Entity (EN) | 实体(中文) | Category | Count |")
     lines.append("|---|---|---|---|---|")
-    article_lookup = {a.url: a for a in articles}
-    for article_url, ents in entities_by_article.items():
-        article = article_lookup.get(article_url)
-        if not article:
-            continue
-        for e in ents:
-            lines.append(
-                f"| {article.title.replace('|', ' ')} | {article.source} | {article.date_iso[:10]} | {e['entity'].replace('|', ' ')} | {e['category']} |"
-            )
+    for idx, row in enumerate(entity_ranking[:60], start=1):
+        lines.append(f"| {idx} | {row['entity_en']} | {row.get('entity_zh','')} | {row['category']} | {row['count']} |")
 
+    lines.append("\n## Trend analysis / 趋势分析")
     lines.append("")
-    lines.append("## Top entities this week")
-    lines.append("")
-    lines.append("| Rank | Entity | Category | Frequency |")
-    lines.append("|---|---|---|---|")
-    for idx, (entity, category, count) in enumerate(entity_rankings[:50], start=1):
-        lines.append(f"| {idx} | {entity.replace('|', ' ')} | {category} | {count} |")
+    for en, zh in zip(trends_en, trends_zh):
+        lines.append(en)
+        if zh:
+            lines.append(zh)
 
+    lines.append("\n## Why output may be empty / 输出可能为空的原因")
     lines.append("")
-    lines.append("## Trend analysis")
-    lines.append("")
-    lines.extend(trends)
+    for source, diag in diagnostics.items():
+        lines.append(
+            f"- {source}: robots disallow={diag.get('robots_disallow',0)}, request failed={diag.get('request_failed',0)}, listing page changed={diag.get('listing_changed',0)}, paywall/no content={diag.get('paywall_or_no_content',0)}, date parse failures kept={diag.get('kept_missing_date',0)}"
+        )
 
-    lines.append("")
-    lines.append("## Limitations & compliance note")
-    lines.append("")
-    lines.append(
-        "- This report uses only public pages and respects robots.txt checks before crawling feed/listing/article URLs."
-    )
-    lines.append("- No paywalls or login-protected areas are accessed.")
-    lines.append("- Stored fields are limited to title, URL, date, short excerpt (<=300 chars), and generated summaries.")
-    lines.append("- Trend analysis is non-LLM keyword-based and may miss nuance; uncertain findings are marked as insufficient evidence.")
+    lines.append("\n## Limitations & compliance note / 合规说明")
+    lines.append("- Public pages only. Respect robots.txt. No login/paywall bypass.")
+    lines.append("- Stored data: title, URL, date (if available), excerpt <= 300 chars, generated summary.")
 
     path.write_text("\n".join(lines), encoding="utf-8")

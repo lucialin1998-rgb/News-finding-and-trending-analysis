@@ -1,217 +1,237 @@
 from __future__ import annotations
 
 import logging
-import re
-import xml.etree.ElementTree as ET
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
 from urllib.robotparser import RobotFileParser
+
+import feedparser
+import requests
+from bs4 import BeautifulSoup
 
 from .parser import extract_article_metadata
 from .utils import (
     Article,
     DomainLimiter,
     cache_path_for_url,
-    dedupe_articles,
+    canonicalize_url,
     in_date_window,
     parse_date_to_iso,
     safe_excerpt,
 )
 
 LOGGER = logging.getLogger(__name__)
-USER_AGENT = "NewsTrendBot/1.0 (+educational-project; respectful scraping)"
+USER_AGENT = "NewsTrendBot/1.1 (+educational-project; respectful scraping)"
 
 SOURCES = {
     "Music Week": {
         "listing_url": "https://www.musicweek.com/news",
-        "feed_candidates": [
-            "https://www.musicweek.com/rss/news",
-            "https://www.musicweek.com/rss",
-            "https://www.musicweek.com/news/rss",
-        ],
+        "mode": "html_primary",
     },
     "Music Business Worldwide": {
         "listing_url": "https://www.musicbusinessworldwide.com/category/news/",
-        "feed_candidates": [
-            "https://www.musicbusinessworldwide.com/feed/",
-            "https://www.musicbusinessworldwide.com/category/news/feed/",
-        ],
+        "rss_url": "https://www.musicbusinessworldwide.com/feed/",
+        "mode": "rss_primary",
     },
 }
 
 
 class NewsCollector:
-    def __init__(self, start_dt, end_dt, max_articles_per_source: int, cache_dir: Path, use_cache: bool, timeout: int = 20):
+    def __init__(self, start_dt, end_dt, max_articles_per_source: int, cache_dir: Path, use_cache: bool, timeout: int = 25):
         self.start_dt = start_dt
         self.end_dt = end_dt
         self.max_articles_per_source = max_articles_per_source
         self.cache_dir = cache_dir
         self.use_cache = use_cache
         self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-GB,en;q=0.8"})
         self.limiter = DomainLimiter(1.0)
         self._robots: Dict[str, Optional[RobotFileParser]] = {}
+        self.diagnostics: Dict[str, dict] = {}
 
     def collect(self) -> Dict[str, List[Article]]:
-        out = {}
-        for source, config in SOURCES.items():
-            articles = self._collect_source(source, config)
-            out[source] = sorted(dedupe_articles(articles), key=lambda a: a.date_iso, reverse=True)
-        return out
+        result: Dict[str, List[Article]] = {}
+        for source, cfg in SOURCES.items():
+            articles, diag = self._collect_source(source, cfg)
+            self.diagnostics[source] = diag
+            result[source] = articles
+        return result
 
-    def _collect_source(self, source: str, config: dict) -> List[Article]:
-        seen_urls: Set[str] = set()
+    def _collect_source(self, source: str, cfg: dict) -> Tuple[List[Article], dict]:
+        diag = {
+            "urls_discovered": 0,
+            "urls_attempted": 0,
+            "articles_fetched": 0,
+            "articles_kept": 0,
+            "dropped_out_of_range": 0,
+            "kept_missing_date": 0,
+            "request_failed": 0,
+            "robots_disallow": 0,
+            "listing_changed": 0,
+            "paywall_or_no_content": 0,
+            "deduped": 0,
+        }
+        seen: Set[str] = set()
         collected: List[Article] = []
 
-        for feed_url in self._discover_feed_urls(config["listing_url"], config["feed_candidates"]):
-            collected.extend(self._collect_from_feed(source, feed_url, seen_urls))
-            if len(collected) >= self.max_articles_per_source:
-                return collected[: self.max_articles_per_source]
+        mode = cfg.get("mode")
+        if mode == "rss_primary":
+            collected.extend(self._collect_from_rss(source, cfg.get("rss_url", ""), seen, diag))
+            if len(collected) < self.max_articles_per_source:
+                collected.extend(self._collect_from_listing(source, cfg["listing_url"], seen, diag))
+        else:
+            collected.extend(self._collect_from_listing(source, cfg["listing_url"], seen, diag))
+            if len(collected) < self.max_articles_per_source and cfg.get("rss_url"):
+                collected.extend(self._collect_from_rss(source, cfg.get("rss_url", ""), seen, diag))
 
-        if len(collected) < self.max_articles_per_source:
-            remaining = self.max_articles_per_source - len(collected)
-            collected.extend(self._collect_from_listing(source, config["listing_url"], seen_urls, remaining))
-
-        return collected[: self.max_articles_per_source]
-
-    def _discover_feed_urls(self, listing_url: str, candidates: List[str]) -> List[str]:
-        urls = list(candidates)
-        html = self._fetch_text(listing_url)
-        if not html:
-            return urls
-        for m in re.finditer(r"<link[^>]+rel=['\"]alternate['\"][^>]*>", html, flags=re.I):
-            tag = m.group(0)
-            if not re.search(r"type=['\"][^'\"]*(rss|atom)[^'\"]*['\"]", tag, flags=re.I):
+        deduped = []
+        for article in collected:
+            key = canonicalize_url(article.url)
+            if key in seen:
+                diag["deduped"] += 1
                 continue
-            href_m = re.search(r"href=['\"]([^'\"]+)['\"]", tag, flags=re.I)
-            if href_m:
-                feed = urljoin(listing_url, href_m.group(1))
-                if feed not in urls:
-                    urls.insert(0, feed)
-        return urls
+            seen.add(key)
+            deduped.append(article)
 
-    def _collect_from_feed(self, source: str, feed_url: str, seen_urls: Set[str]) -> List[Article]:
-        if not self._can_fetch(feed_url):
+        deduped = deduped[: self.max_articles_per_source]
+        diag["articles_kept"] = len(deduped)
+        LOGGER.info(
+            "%s diagnostics: discovered=%d attempted=%d fetched=%d kept=%d dropped_out_of_range=%d kept_missing_date=%d request_failed=%d robots_disallow=%d",
+            source,
+            diag["urls_discovered"],
+            diag["urls_attempted"],
+            diag["articles_fetched"],
+            diag["articles_kept"],
+            diag["dropped_out_of_range"],
+            diag["kept_missing_date"],
+            diag["request_failed"],
+            diag["robots_disallow"],
+        )
+        return deduped, diag
+
+    def _collect_from_rss(self, source: str, rss_url: str, seen: Set[str], diag: dict) -> List[Article]:
+        if not rss_url:
             return []
-        xml_text = self._fetch_text(feed_url)
-        if not xml_text:
+        if not self._can_fetch(rss_url):
+            diag["robots_disallow"] += 1
+            return []
+        xml = self._fetch_text(rss_url, diag)
+        if not xml:
             return []
 
-        results = []
-        for item in self._parse_feed_items(xml_text):
-            url = item.get("link")
-            if not url or url in seen_urls:
+        feed = feedparser.parse(xml)
+        output: List[Article] = []
+        for entry in feed.entries:
+            url = entry.get("link")
+            if not url:
                 continue
-            date_iso = parse_date_to_iso(item.get("date"))
-            if not date_iso or not in_date_window(date_iso, self.start_dt, self.end_dt):
+            diag["urls_discovered"] += 1
+            if canonicalize_url(url) in seen:
                 continue
             article = Article(
                 source=source,
-                title=item.get("title") or "Untitled",
+                title_en=(entry.get("title") or "Untitled").strip(),
                 url=url,
-                date_iso=date_iso,
-                excerpt=safe_excerpt(item.get("summary") or ""),
-                text_for_nlp=f"{item.get('title','')}. {item.get('summary','')}",
+                date=parse_date_to_iso(entry.get("published") or entry.get("updated") or "") or "",
+                excerpt_en=safe_excerpt(BeautifulSoup(entry.get("summary", ""), "html.parser").get_text(" ", strip=True)),
+                text_for_nlp="",
             )
-            seen_urls.add(url)
-            results.append(self._enrich_article(article))
-        if results:
-            LOGGER.info("Feed strategy succeeded for %s (%d)", source, len(results))
-        return results
+            enriched = self._fetch_article_page(article, diag)
+            if self._should_keep(enriched, diag):
+                output.append(enriched)
+        return output
 
-    def _parse_feed_items(self, xml_text: str) -> List[dict]:
-        try:
-            root = ET.fromstring(xml_text)
-        except ET.ParseError:
-            return []
-        items = []
-        for node in root.findall(".//item") + root.findall(".//{http://www.w3.org/2005/Atom}entry"):
-            title = _text(node, ["title", "{http://www.w3.org/2005/Atom}title"])
-            link = _text(node, ["link", "{http://www.w3.org/2005/Atom}link"])
-            if not link:
-                atom_link = node.find("{http://www.w3.org/2005/Atom}link")
-                if atom_link is not None:
-                    link = atom_link.attrib.get("href")
-            date = _text(node, ["pubDate", "published", "updated", "{http://www.w3.org/2005/Atom}published"])
-            summary = _text(node, ["description", "summary", "{http://www.w3.org/2005/Atom}summary"])
-            items.append({"title": title, "link": link, "date": date, "summary": summary})
-        return items
-
-    def _collect_from_listing(self, source: str, listing_url: str, seen_urls: Set[str], limit: int) -> List[Article]:
+    def _collect_from_listing(self, source: str, listing_url: str, seen: Set[str], diag: dict) -> List[Article]:
         if not self._can_fetch(listing_url):
+            diag["robots_disallow"] += 1
             return []
-        html = self._fetch_text(listing_url)
+        html = self._fetch_text(listing_url, diag)
         if not html:
             return []
 
-        links = []
-        for m in re.finditer(r"<a[^>]+href=['\"]([^'\"]+)['\"]", html, flags=re.I):
-            url = urljoin(listing_url, m.group(1))
-            if urlparse(url).netloc != urlparse(listing_url).netloc:
+        soup = BeautifulSoup(html, "html.parser")
+        urls = []
+        for link in soup.select("a[href]"):
+            href = link.get("href")
+            if not href:
                 continue
-            if "/news/" not in url and "/category/news/" not in url:
+            full = urljoin(listing_url, href)
+            if urlparse(full).netloc != urlparse(listing_url).netloc:
                 continue
-            links.append(url)
+            if source == "Music Week" and "/news/" not in full:
+                continue
+            if source == "Music Business Worldwide" and "/" not in full:
+                continue
+            urls.append(full)
 
-        unique_links = list(dict.fromkeys(links))
-        results = []
-        for url in unique_links:
-            if len(results) >= limit or url in seen_urls or not self._can_fetch(url):
-                continue
-            page = self._fetch_text(url)
-            if not page:
-                continue
-            meta = extract_article_metadata(page, url)
-            if not meta.get("date_iso") or not in_date_window(meta["date_iso"], self.start_dt, self.end_dt):
-                continue
-            results.append(
-                Article(
-                    source=source,
-                    title=meta["title"],
-                    url=url,
-                    date_iso=meta["date_iso"],
-                    excerpt=safe_excerpt(meta["excerpt"]),
-                    text_for_nlp=meta.get("full_text") or f"{meta['title']}. {meta['excerpt']}",
-                )
-            )
-            seen_urls.add(url)
-        if results:
-            LOGGER.info("HTML fallback collected %d for %s", len(results), source)
-        return results
+        unique_urls = list(dict.fromkeys(urls))
+        diag["urls_discovered"] += len(unique_urls)
+        if not unique_urls:
+            diag["listing_changed"] += 1
+            LOGGER.warning("%s listing page structure may have changed: no candidate links found", source)
 
-    def _enrich_article(self, article: Article) -> Article:
+        output: List[Article] = []
+        for url in unique_urls:
+            if len(output) >= self.max_articles_per_source:
+                break
+            if canonicalize_url(url) in seen:
+                continue
+            article = Article(source=source, title_en="Untitled", url=url)
+            enriched = self._fetch_article_page(article, diag)
+            if self._should_keep(enriched, diag):
+                output.append(enriched)
+        return output
+
+    def _should_keep(self, article: Article, diag: dict) -> bool:
+        if article.date:
+            if not in_date_window(article.date, self.start_dt, self.end_dt):
+                diag["dropped_out_of_range"] += 1
+                return False
+        else:
+            diag["kept_missing_date"] += 1
+        return True
+
+    def _fetch_article_page(self, article: Article, diag: dict) -> Article:
         if not self._can_fetch(article.url):
+            diag["robots_disallow"] += 1
             return article
-        html = self._fetch_text(article.url)
+        diag["urls_attempted"] += 1
+        html = self._fetch_text(article.url, diag)
         if not html:
             return article
-        meta = extract_article_metadata(html, article.url)
-        if meta.get("title") and meta["title"] != "Untitled":
-            article.title = meta["title"]
-        if meta.get("date_iso"):
-            article.date_iso = meta["date_iso"]
-        if meta.get("excerpt"):
-            article.excerpt = safe_excerpt(meta["excerpt"])
-        if meta.get("full_text"):
-            article.text_for_nlp = meta["full_text"]
+        diag["articles_fetched"] += 1
+        parsed = extract_article_metadata(html, article.url)
+        article.url = parsed.get("canonical_url") or article.url
+        article.title_en = parsed.get("title") or article.title_en
+        article.date = parsed.get("date") or article.date
+        article.excerpt_en = safe_excerpt(parsed.get("excerpt", "") or article.excerpt_en)
+        article.text_for_nlp = parsed.get("text") or f"{article.title_en}. {article.excerpt_en}"
+        if not article.excerpt_en and not article.text_for_nlp:
+            diag["paywall_or_no_content"] += 1
         return article
 
-    def _fetch_text(self, url: str) -> Optional[str]:
+    def _fetch_text(self, url: str, diag: dict) -> Optional[str]:
         cache_file = cache_path_for_url(self.cache_dir, url)
         if self.use_cache and cache_file.exists():
             return cache_file.read_text(encoding="utf-8", errors="ignore")
         self.limiter.wait(url)
         try:
-            req = Request(url, headers={"User-Agent": USER_AGENT, "Accept-Language": "en-GB,en;q=0.8"})
-            with urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8", errors="ignore")
-                if self.use_cache:
-                    cache_file.parent.mkdir(parents=True, exist_ok=True)
-                    cache_file.write_text(body, encoding="utf-8")
-                return body
-        except Exception as exc:
-            LOGGER.warning("Network error for %s: %s", url, exc)
+            response = self.session.get(url, timeout=self.timeout)
+            if response.status_code >= 400:
+                diag["request_failed"] += 1
+                LOGGER.warning("HTTP %s for %s", response.status_code, url)
+                return None
+            text = response.text
+            if self.use_cache:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(text, encoding="utf-8")
+            return text
+        except requests.RequestException as exc:
+            diag["request_failed"] += 1
+            LOGGER.warning("Request failed for %s: %s", url, exc)
             return None
 
     def _can_fetch(self, url: str) -> bool:
@@ -226,14 +246,4 @@ class NewsCollector:
             except Exception:
                 self._robots[root] = None
         rp = self._robots[root]
-        if rp is None:
-            return True
-        return rp.can_fetch(USER_AGENT, url)
-
-
-def _text(node, tags: List[str]) -> str:
-    for t in tags:
-        found = node.find(t)
-        if found is not None and found.text:
-            return found.text.strip()
-    return ""
+        return True if rp is None else rp.can_fetch(USER_AGENT, url)

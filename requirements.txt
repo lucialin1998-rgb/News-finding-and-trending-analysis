@@ -1,5 +1,6 @@
-# No mandatory third-party dependencies.
-# This project runs on Python 3.11+ standard library only.
-# Optional:
-# spacy>=3.7.0
-# If installed, also run: python -m spacy download en_core_web_sm
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+feedparser>=6.0.10
+python-dateutil>=2.8.2
+spacy>=3.7.0
+argos-translate>=1.9.6
