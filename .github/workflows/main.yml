@@ -1,0 +1,36 @@
+name: Weekly Music News Analyzer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  run-analyzer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+         python -m pip install --upgrade pip
+         pip install spacy
+         pip install -r requirements.txt
+         python -m spacy download en_core_web_sm
+
+      - name: Run analyzer
+        run: |
+          python main.py --days 7
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-report
+          path: output/
